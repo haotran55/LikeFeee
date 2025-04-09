@@ -1,171 +1,239 @@
+from flask import Flask, request, jsonify
+import asyncio
+from Crypto.Cipher import AES
+from Crypto.Util.Padding import pad
+from google.protobuf.json_format import MessageToJson
+import binascii
+import aiohttp
 import requests
 import json
-import os
-import re
-from pathlib import Path
+import like_pb2
+import like_count_pb2
+import uid_generator_pb2
+from google.protobuf.message import DecodeError
 
-def display_ascii_art():
-    print(r"""
- █████╗ ██╗  ██╗██╗    ██████╗  ██╗   ██╗
-██╔══██╗██║ ██╔╝██║    ██╔══██╗ ██║   ██║
-███████║█████╔╝ ██║    ██████╔╝ ██║   ██║
-██╔══██║██╔═██╗ ██║    ██╔══██╗ ██║   ██║
-██║  ██║██║  ██╗██║    ██║  ██║ ╚██████╔╝
-╚═╝  ╚═╝╚═╝  ╚═╝╚═╝    ╚═╝  ╚═╝  ╚═════╝ 
-""")
+app = Flask(__name__)
 
-def fetch_token(uid, password):
-    url = f"https://ariflexlabs-jwt-gen.onrender.com/fetch-token?uid={uid}&password={password}"
+def load_tokens(server_name):
     try:
-        response = requests.get(url, timeout=10)
-        if response.status_code == 200:
-            data = response.json()
-            return data.get('JWT TOKEN')
+        if server_name == "IND":
+            with open("token_ind.json", "r") as f:
+                tokens = json.load(f)
+        elif server_name in {"BR", "US", "SAC", "NA"}:
+            with open("token_br.json", "r") as f:
+                tokens = json.load(f)
         else:
-            print(f"❌ Error fetching token for UID {uid}: HTTP {response.status_code}")
+            with open("token_bd.json", "r") as f:
+                tokens = json.load(f)
+        return tokens
+    except Exception as e:
+        app.logger.error(f"Error loading tokens for server {server_name}: {e}")
+        return None
+
+def encrypt_message(plaintext):
+    try:
+        key = b'Yg&tc%DEuh6%Zc^8'
+        iv = b'6oyZDr22E3ychjM%'
+        cipher = AES.new(key, AES.MODE_CBC, iv)
+        padded_message = pad(plaintext, AES.block_size)
+        encrypted_message = cipher.encrypt(padded_message)
+        return binascii.hexlify(encrypted_message).decode('utf-8')
+    except Exception as e:
+        app.logger.error(f"Error encrypting message: {e}")
+        return None
+
+def create_protobuf_message(user_id, region):
+    try:
+        message = like_pb2.like()
+        message.uid = int(user_id)
+        message.region = region
+        return message.SerializeToString()
+    except Exception as e:
+        app.logger.error(f"Error creating protobuf message: {e}")
+        return None
+
+async def send_request(encrypted_uid, token, url):
+    try:
+        edata = bytes.fromhex(encrypted_uid)
+        headers = {
+            'User-Agent': "Dalvik/2.1.0 (Linux; U; Android 9; ASUS_Z01QD Build/PI)",
+            'Connection': "Keep-Alive",
+            'Accept-Encoding': "gzip",
+            'Authorization': f"Bearer {token}",
+            'Content-Type': "application/x-www-form-urlencoded",
+            'Expect': "100-continue",
+            'X-Unity-Version': "2018.4.11f1",
+            'X-GA': "v1 1",
+            'ReleaseVersion': "OB48"
+        }
+        async with aiohttp.ClientSession() as session:
+            async with session.post(url, data=edata, headers=headers) as response:
+                if response.status != 200:
+                    app.logger.error(f"Request failed with status code: {response.status}")
+                    return response.status
+                return await response.text()
+    except Exception as e:
+        app.logger.error(f"Exception in send_request: {e}")
+        return None
+
+async def send_multiple_requests(uid, server_name, url):
+    try:
+        region = server_name
+        protobuf_message = create_protobuf_message(uid, region)
+        if protobuf_message is None:
+            app.logger.error("Failed to create protobuf message.")
             return None
-    except requests.Timeout:
-        print(f"⌛ Timeout occurred while fetching token for UID {uid}")
+        encrypted_uid = encrypt_message(protobuf_message)
+        if encrypted_uid is None:
+            app.logger.error("Encryption failed.")
+            return None
+        tasks = []
+        tokens = load_tokens(server_name)
+        if tokens is None:
+            app.logger.error("Failed to load tokens.")
+            return None
+        for i in range(100):
+            token = tokens[i % len(tokens)]["token"]
+            tasks.append(send_request(encrypted_uid, token, url))
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        return results
+    except Exception as e:
+        app.logger.error(f"Exception in send_multiple_requests: {e}")
+        return None
+
+def create_protobuf(uid):
+    try:
+        message = uid_generator_pb2.uid_generator()
+        message.saturn_ = int(uid)
+        message.garena = 1
+        return message.SerializeToString()
+    except Exception as e:
+        app.logger.error(f"Error creating uid protobuf: {e}")
+        return None
+
+def enc(uid):
+    protobuf_data = create_protobuf(uid)
+    if protobuf_data is None:
+        return None
+    encrypted_uid = encrypt_message(protobuf_data)
+    return encrypted_uid
+
+def make_request(encrypt, server_name, token):
+    try:
+        if server_name == "IND":
+            url = "https://client.ind.freefiremobile.com/GetPlayerPersonalShow"
+        elif server_name in {"BR", "US", "SAC", "NA"}:
+            url = "https://client.us.freefiremobile.com/GetPlayerPersonalShow"
+        else:
+            url = "https://clientbp.ggblueshark.com/GetPlayerPersonalShow"
+        edata = bytes.fromhex(encrypt)
+        headers = {
+            'User-Agent': "Dalvik/2.1.0 (Linux; U; Android 9; ASUS_Z01QD Build/PI)",
+            'Connection': "Keep-Alive",
+            'Accept-Encoding': "gzip",
+            'Authorization': f"Bearer {token}",
+            'Content-Type': "application/x-www-form-urlencoded",
+            'Expect': "100-continue",
+            'X-Unity-Version': "2018.4.11f1",
+            'X-GA': "v1 1",
+            'ReleaseVersion': "OB48"
+        }
+        response = requests.post(url, data=edata, headers=headers, verify=False)
+        hex_data = response.content.hex()
+        binary = bytes.fromhex(hex_data)
+        decode = decode_protobuf(binary)
+        if decode is None:
+            app.logger.error("Protobuf decoding returned None.")
+        return decode
+    except Exception as e:
+        app.logger.error(f"Error in make_request: {e}")
+        return None
+
+def decode_protobuf(binary):
+    try:
+        items = like_count_pb2.Info()
+        items.ParseFromString(binary)
+        return items
+    except DecodeError as e:
+        app.logger.error(f"Error decoding Protobuf data: {e}")
         return None
     except Exception as e:
-        print(f"⚠️ Exception occurred: {str(e)}")
+        app.logger.error(f"Unexpected error during protobuf decoding: {e}")
         return None
 
-def process_json_file(file_path):
+@app.route('/like', methods=['GET'])
+def handle_requests():
+    uid = request.args.get("uid")
+    server_name = request.args.get("server_name", "").upper()
+    if not uid or not server_name:
+        return jsonify({"error": "UID and server_name are required"}), 400
+
     try:
-        with open(file_path, 'r') as file:
-            accounts = json.load(file)
-        
-        tokens = []
-        for idx, account in enumerate(accounts, 1):
-            uid = account.get('uid')
-            password = account.get('password')
-            if uid and password:
-                print(f"\n🔹 Processing account {idx}/{len(accounts)} - UID: {uid}")
-                token = fetch_token(uid, password)
-                if token:
-                    tokens.append({"token": token})
-                    print("✅ Token generated successfully!")
-                else:
-                    print("❌ Failed to generate token")
+        def process_request():
+            tokens = load_tokens(server_name)
+            if tokens is None:
+                raise Exception("Failed to load tokens.")
+            token = tokens[0]['token']
+            encrypted_uid = enc(uid)
+            if encrypted_uid is None:
+                raise Exception("Encryption of UID failed.")
+
+            # الحصول على بيانات اللاعب قبل تنفيذ عملية الإعجاب
+            before = make_request(encrypted_uid, server_name, token)
+            if before is None:
+                raise Exception("Failed to retrieve initial player info.")
+            try:
+                jsone = MessageToJson(before)
+            except Exception as e:
+                raise Exception(f"Error converting 'before' protobuf to JSON: {e}")
+            data_before = json.loads(jsone)
+            before_like = data_before.get('AccountInfo', {}).get('Likes', 0)
+            try:
+                before_like = int(before_like)
+            except Exception:
+                before_like = 0
+            app.logger.info(f"Likes before command: {before_like}")
+
+            # تحديد رابط الإعجاب حسب اسم السيرفر
+            if server_name == "IND":
+                url = "https://client.ind.freefiremobile.com/LikeProfile"
+            elif server_name in {"BR", "US", "SAC", "NA"}:
+                url = "https://client.us.freefiremobile.com/LikeProfile"
             else:
-                print(f"⚠️ Skipping invalid account (missing uid or password)")
-        
-        return tokens
-    except json.JSONDecodeError:
-        print("❌ Error: Invalid JSON file format")
-        return []
+                url = "https://clientbp.ggblueshark.com/LikeProfile"
+
+            # إرسال الطلبات بشكل غير متزامن
+            asyncio.run(send_multiple_requests(uid, server_name, url))
+
+            # الحصول على بيانات اللاعب بعد تنفيذ عملية الإعجاب
+            after = make_request(encrypted_uid, server_name, token)
+            if after is None:
+                raise Exception("Failed to retrieve player info after like requests.")
+            try:
+                jsone_after = MessageToJson(after)
+            except Exception as e:
+                raise Exception(f"Error converting 'after' protobuf to JSON: {e}")
+            data_after = json.loads(jsone_after)
+            after_like = int(data_after.get('AccountInfo', {}).get('Likes', 0))
+            player_uid = int(data_after.get('AccountInfo', {}).get('UID', 0))
+            player_name = str(data_after.get('AccountInfo', {}).get('PlayerNickname', ''))
+            like_given = after_like - before_like
+            status = 1 if like_given != 0 else 2
+            result = {
+                "LikesGivenByAPI": like_given,
+                "LikesafterCommand": after_like,
+                "LikesbeforeCommand": before_like,
+                "PlayerNickname": player_name,
+                "UID": player_uid,
+                "status": status
+            }
+            return result
+
+        result = process_request()
+        return jsonify(result)
     except Exception as e:
-        print(f"⚠️ Error processing file: {str(e)}")
-        return []
+        app.logger.error(f"Error processing request: {e}")
+        return jsonify({"error": str(e)}), 500
 
-def process_guest_file(file_path):
-    try:
-        with open(file_path, 'r') as file:
-            data = json.load(file)
-        
-        guest_info = data.get('guest_account_info', {})
-        uid = guest_info.get('com.garena.msdk.guest_uid')
-        password = guest_info.get('com.garena.msdk.guest_password')
-        
-        if uid and password:
-            print(f"\n🔹 Processing Guest UID: {uid}")
-            token = fetch_token(uid, password)
-            if token:
-                print("✅ Token generated successfully!")
-                return [{"token": token}]
-            else:
-                print("❌ Failed to generate token")
-                return []
-        else:
-            print("⚠️ Invalid guest file format (missing uid or password)")
-            return []
-    except json.JSONDecodeError:
-        print("❌ Error: Invalid guest file format")
-        return []
-    except Exception as e:
-        print(f"⚠️ Error processing file: {str(e)}")
-        return []
-
-def process_guest_files(directory):
-    try:
-        guest_files = [f for f in os.listdir(directory) if re.match(r'guest\d+\.dat', f)]
-        if not guest_files:
-            print("❌ No guest files found in the directory")
-            return []
-        
-        print(f"\nFound {len(guest_files)} guest files to process...")
-        tokens = []
-        
-        for idx, guest_file in enumerate(guest_files, 1):
-            print(f"\n📁 Processing file {idx}/{len(guest_files)}: {guest_file}")
-            file_tokens = process_guest_file(os.path.join(directory, guest_file))
-            if file_tokens:
-                tokens.extend(file_tokens)
-        
-        return tokens
-    except Exception as e:
-        print(f"⚠️ Error reading directory: {str(e)}")
-        return []
-
-def save_tokens(tokens, output_file='AKIRU-JWT.json'):
-    try:
-        with open(output_file, 'w') as file:
-            json.dump(tokens, file, indent=4)
-        print(f"\n💾 Successfully saved {len(tokens)} tokens to '{output_file}'")
-        print(f"📂 File location: {os.path.abspath(output_file)}")
-    except Exception as e:
-        print(f"❌ Error saving tokens: {str(e)}")
-
-def get_file_path(prompt, default):
-    while True:
-        path = input(prompt).strip()
-        path = path if path else default
-        if os.path.exists(path):
-            return path
-        print(f"❌ Path does not exist: {path}\nPlease try again.")
-
-def main():
-    display_ascii_art()
-    
-    while True:
-        print("\n" + "="*40)
-        print("MAIN MENU".center(40))
-        print("="*40)
-        print("1. Process from JSON file (multiple accounts)")
-        print("2. Process from guest files (guest*.dat)")
-        print("3. Exit")
-        
-        choice = input("\nSelect an option (1-3): ").strip()
-        
-        if choice == '1':
-            print("\n" + " JSON File Processing ".center(40, "-"))
-            file_path = get_file_path(
-                "Enter JSON file path [default: accounts.json]: ",
-                "accounts.json"
-            )
-            tokens = process_json_file(file_path)
-            if tokens:
-                save_tokens(tokens)
-        
-        elif choice == '2':
-            print("\n" + " Guest Files Processing ".center(40, "-"))
-            dir_path = get_file_path(
-                "Enter directory path [default: current directory]: ",
-                "."
-            )
-            tokens = process_guest_files(dir_path)
-            if tokens:
-                save_tokens(tokens)
-        
-        elif choice == '3':
-            print("\n👋 Thank you for using the JWT Generator!")
-            break
-        
-        else:
-            print("❌ Invalid option. Please select 1, 2, or 3.")
-        
-        input("\nPress Enter to continue...")
-
-if __name__ == "__main__":
-    main()
+if __name__ == '__main__':
+    app.run(debug=True, use_reloader=False)
